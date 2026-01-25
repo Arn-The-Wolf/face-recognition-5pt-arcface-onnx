@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+data/enroll/*/
+data/db/*.npz
+data/db/*.json
+models/*.onnx
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+*.mov
+*.npy
+*.txt
+evaluation_plots.png
+
+# Logs
+*.log
+
+# Temporary files
+test_*.jpg
+aligned_*.jpg
+haar_5pt_*.jpg
+landmarks_*.txt
+test_embedding.npy
