@@ -1,336 +1,261 @@
-#!/usr/bin/env python3
+# src/embed.py
 """
-Face embedding module using ArcFace ONNX model
-Extracts L2-normalized 512-dimensional embeddings as specified in the document
-"""
+Embedding stage (ArcFace ONNX) using your working pipeline:
+camera
+-> Haar detection
+-> FaceMesh 5pt
+-> align_face_5pt (112x112)
+-> ArcFace embedding
+-> vector visualization (education)
 
+Run:
+python -m src.embed
+
+Keys:
+q : quit
+p : print embedding stats to terminal
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Tuple, Optional
+import time
 import cv2
 import numpy as np
 import onnxruntime as ort
-import os
 
-class ArcFaceEmbedder:
-    """ArcFace ONNX embedder for face recognition"""
-    
-    def __init__(self, model_path="models/embedder_arcface.onnx"):
-        """
-        Initialize ArcFace embedder
-        
-        Args:
-            model_path: Path to ArcFace ONNX model (w600k_r50.onnx)
-        """
-        self.model_path = model_path
-        self.session = None
-        self.input_name = None
-        self.output_name = None
-        
-        self._load_model()
-        
-    def _load_model(self):
-        """Load ONNX model"""
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"ArcFace model not found: {self.model_path}")
-            
-        try:
-            # Create ONNX Runtime session (CPU only)
-            providers = ['CPUExecutionProvider']
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
-            
-            # Get input/output names
-            self.input_name = self.session.get_inputs()[0].name
-            self.output_name = self.session.get_outputs()[0].name
-            
-            # Get input shape
-            input_shape = self.session.get_inputs()[0].shape
-            output_shape = self.session.get_outputs()[0].shape
-            
-            print(f"ArcFace model loaded successfully")
-            print(f"Input shape: {input_shape}")
-            print(f"Output shape: {output_shape}")
-            print(f"Expected embedding dimension: 512")
-            
-            # Validate expected dimensions
-            if output_shape[-1] != 512:
-                print(f"WARNING: Expected 512-D embeddings, got {output_shape[-1]}-D")
-                
-        except Exception as e:
-            raise RuntimeError(f"Failed to load ArcFace model: {e}")
-            
-    def extract_embedding(self, aligned_face):
-        """
-        Extract face embedding from aligned face image
-        
-        Args:
-            aligned_face: Aligned face image (112x112, BGR)
-            
-        Returns:
-            numpy.ndarray: L2-normalized 512-dimensional embedding vector
-                          Returns None if extraction fails
-        """
-        if aligned_face is None:
-            return None
-            
-        try:
-            # Preprocess image for ArcFace
-            input_blob = self._preprocess_face(aligned_face)
-            
-            # Run inference
-            embedding = self.session.run([self.output_name], {self.input_name: input_blob})[0]
-            
-            # Extract embedding vector (remove batch dimension)
-            embedding = embedding[0]  # Shape: (512,)
-            
-            # L2 normalize embedding
-            embedding_norm = np.linalg.norm(embedding)
-            if embedding_norm > 0:
-                embedding = embedding / embedding_norm
-            else:
-                print("WARNING: Zero embedding norm detected")
-                return None
-                
-            return embedding.astype(np.float32)
-            
-        except Exception as e:
-            print(f"Embedding extraction failed: {e}")
-            return None
-            
-    def _preprocess_face(self, aligned_face):
-        """
-        Preprocess aligned face for ArcFace model
-        
-        Args:
-            aligned_face: Aligned face image (112x112, BGR)
-            
-        Returns:
-            numpy.ndarray: Preprocessed input blob (1, 3, 112, 112)
-        """
-        # Ensure correct size
-        if aligned_face.shape[:2] != (112, 112):
-            aligned_face = cv2.resize(aligned_face, (112, 112))
-            
-        # Convert BGR to RGB
-        face_rgb = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB)
-        
-        # Normalize to [0, 1] and convert to float32
-        face_normalized = face_rgb.astype(np.float32) / 255.0
-        
-        # Transpose to CHW format (channels first)
-        face_chw = np.transpose(face_normalized, (2, 0, 1))
-        
-        # Add batch dimension
-        input_blob = np.expand_dims(face_chw, axis=0)  # Shape: (1, 3, 112, 112)
-        
-        return input_blob
-        
-    def compute_similarity(self, embedding1, embedding2):
-        """
-        Compute cosine similarity between two embeddings
-        
-        Args:
-            embedding1: First embedding vector (512,)
-            embedding2: Second embedding vector (512,)
-            
-        Returns:
-            float: Cosine similarity [-1, 1]
-        """
-        if embedding1 is None or embedding2 is None:
-            return 0.0
-            
-        # Cosine similarity (embeddings are already L2-normalized)
-        similarity = np.dot(embedding1, embedding2)
-        return float(similarity)
-        
-    def validate_embedding(self, embedding):
-        """
-        Validate embedding properties
-        
-        Args:
-            embedding: Embedding vector to validate
-            
-        Returns:
-            dict: Validation results
-        """
-        if embedding is None:
-            return {'valid': False, 'reason': 'None embedding'}
-            
-        # Check dimension
-        if embedding.shape != (512,):
-            return {'valid': False, 'reason': f'Wrong dimension: {embedding.shape}'}
-            
-        # Check L2 norm (should be ~1.0 for normalized embeddings)
-        norm = np.linalg.norm(embedding)
-        if abs(norm - 1.0) > 0.01:
-            return {'valid': False, 'reason': f'Not L2-normalized: norm={norm:.4f}'}
-            
-        # Check for NaN or inf values
-        if not np.isfinite(embedding).all():
-            return {'valid': False, 'reason': 'Contains NaN or inf values'}
-            
-        # Check embedding magnitude (before normalization should be ~15-30)
-        # This is an approximation since we only have normalized embedding
-        return {
-            'valid': True,
-            'dimension': embedding.shape[0],
-            'norm': norm,
-            'mean': np.mean(embedding),
-            'std': np.std(embedding)
-        }
+from .haar_5pt import Haar5ptDetector, align_face_5pt
 
-def test_embedding():
-    """Test embedding extraction with camera"""
-    print("Testing ArcFace embedding extraction...")
-    
-    try:
-        from camera import Camera
-        from detect import HaarFaceDetector
-        from landmarks import FivePtLandmarkDetector
-        from align import FaceAligner
-        
-        # Check if model exists
-        model_path = "models/embedder_arcface.onnx"
-        if not os.path.exists(model_path):
-            print(f"ERROR: ArcFace model not found at {model_path}")
-            print("Please download w600k_r50.onnx and place it in the models/ directory")
-            return
-            
-        detector = HaarFaceDetector()
-        landmark_detector = FivePtLandmarkDetector()
-        aligner = FaceAligner()
-        embedder = ArcFaceEmbedder(model_path)
-        
-        with Camera() as camera:
-            print("Embedding extraction test started")
-            print("Press 'q' to quit, 's' to save embedding")
-            
-            while True:
-                ret, frame = camera.read_frame()
-                if not ret:
-                    print("Failed to read frame")
-                    break
-                    
-                # Full pipeline
-                faces = detector.detect_faces(frame)
-                landmarks_5pt = None
-                aligned_face = None
-                embedding = None
-                
-                if faces:
-                    landmarks_5pt = landmark_detector.detect_landmarks(frame, faces[0])
-                    if landmarks_5pt is not None:
-                        aligned_face = aligner.align_face(frame, landmarks_5pt)
-                        if aligned_face is not None:
-                            embedding = embedder.extract_embedding(aligned_face)
-                
-                # Draw results
-                result = detector.draw_faces(frame, faces, color=(255, 0, 0))
-                if landmarks_5pt is not None:
-                    result = landmark_detector.draw_landmarks(result, landmarks_5pt)
-                
-                # Display info
-                cv2.putText(result, f"Faces: {len(faces)}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                
-                if embedding is not None:
-                    validation = embedder.validate_embedding(embedding)
-                    if validation['valid']:
-                        cv2.putText(result, "Embedding: OK", (10, 70),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        cv2.putText(result, f"Dim: {validation['dimension']}", (10, 100),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        cv2.putText(result, f"Norm: {validation['norm']:.3f}", (10, 130),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    else:
-                        cv2.putText(result, f"Embedding: {validation['reason']}", (10, 70),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                else:
-                    cv2.putText(result, "No embedding", (10, 70),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                cv2.putText(result, "Press 'q' to quit, 's' to save", (10, 200),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                # Show frames
-                cv2.imshow('Embedding Extraction - Original', result)
-                
-                if aligned_face is not None:
-                    aligned_display = cv2.resize(aligned_face, (224, 224), interpolation=cv2.INTER_NEAREST)
-                    cv2.imshow('Embedding Extraction - Aligned', aligned_display)
-                
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('s') and embedding is not None:
-                    # Save embedding
-                    np.save("test_embedding.npy", embedding)
-                    print(f"Saved embedding: shape={embedding.shape}, norm={np.linalg.norm(embedding):.3f}")
-                    
-    except Exception as e:
-        print(f"Embedding test failed: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        cv2.destroyAllWindows()
+# -------------------------
+# Data
+# -------------------------
+@dataclass
+class EmbeddingResult:
+    embedding: np.ndarray # (D,) float32, L2-normalized
+    norm_before: float
+    dim: int
 
-def test_embedding_image(image_path):
-    """Test embedding extraction on a single image"""
-    if not os.path.exists(image_path):
-        print(f"Image not found: {image_path}")
-        return
+# -------------------------
+# Embedder
+# -------------------------
+class ArcFaceEmbedderONNX:
+    """
+    ArcFace / InsightFace-style ONNX embedder.
+    Input: aligned 112x112 BGR image.
+    Output: L2-normalized embedding vector.
+    """
+    def __init__(
+        self,
+        model_path: str = "models/embedder_arcface.onnx",
+        input_size: Tuple[int, int] = (112, 112),
+        debug: bool = False,
+    ):
+        self.in_w, self.in_h = input_size
+        self.debug = debug
+        self.sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self.in_name = self.sess.get_inputs()[0].name
+        self.out_name = self.sess.get_outputs()[0].name
         
-    model_path = "models/embedder_arcface.onnx"
-    if not os.path.exists(model_path):
-        print(f"ERROR: ArcFace model not found at {model_path}")
-        return
+        if debug:
+            print("[embed] model loaded")
+            print("[embed] input:", self.sess.get_inputs()[0].shape)
+            print("[embed] output:", self.sess.get_outputs()[0].shape)
+
+    def _preprocess(self, aligned_bgr: np.ndarray) -> np.ndarray:
+        if aligned_bgr.shape[:2] != (self.in_h, self.in_w):
+            aligned_bgr = cv2.resize(aligned_bgr, (self.in_w, self.in_h))
+            
+        rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        rgb = (rgb - 127.5) / 128.0
+        x = np.transpose(rgb, (2, 0, 1))[None, ...]
+        return x.astype(np.float32)
+
+    @staticmethod
+    def _l2_normalize(v: np.ndarray, eps: float = 1e-12):
+        n = float(np.linalg.norm(v) + eps)
+        return (v / n).astype(np.float32), n
+
+    def embed(self, aligned_bgr: np.ndarray) -> EmbeddingResult:
+        x = self._preprocess(aligned_bgr)
+        y = self.sess.run([self.out_name], {self.in_name: x})[0]
+        v = y.reshape(-1).astype(np.float32)
+        v_norm, n0 = self._l2_normalize(v)
+        return EmbeddingResult(v_norm, n0, v_norm.size)
+
+# -------------------------
+# Visualization helpers
+# -------------------------
+def draw_text_block(img, lines, origin=(10, 30), scale=0.7, color=(0, 255, 0)):
+    x, y = origin
+    for line in lines:
+        cv2.putText(img, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
+        y += int(28 * scale)
+
+def draw_embedding_matrix(
+    img: np.ndarray,
+    emb: np.ndarray,
+    top_left=(10, 220),
+    cell_scale: int = 6,
+    title: str = "embedding"
+):
+    """
+    Visualize embedding vector as a heatmap matrix.
+    """
+    D = emb.size
+    cols = int(np.ceil(np.sqrt(D)))
+    rows = int(np.ceil(D / cols))
+    
+    mat = np.zeros((rows, cols), dtype=np.float32)
+    mat.flat[:D] = emb
+    
+    norm = (mat - mat.min()) / (mat.max() - mat.min() + 1e-6)
+    gray = (norm * 255).astype(np.uint8)
+    heat = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+    
+    heat = cv2.resize(
+        heat,
+        (cols * cell_scale, rows * cell_scale),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    
+    x, y = top_left
+    h, w = heat.shape[:2]
+    ih, iw = img.shape[:2]
+    
+    if x + w > iw or y + h > ih:
+        return 0, 0
+
+    img[y:y+h, x:x+w] = heat
+    
+    cv2.putText(
+        img,
+        title,
+        (x, y - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (200, 200, 200),
+        2,
+    )
+    return w, h
+
+def emb_preview_str(emb: np.ndarray, n: int = 8) -> str:
+    vals = " ".join(f"{v:+.3f}" for v in emb[:n])
+    return f"vec[0:{n}]: {vals} ..."
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b))
+
+# -------------------------
+# Demo
+# -------------------------
+def main():
+    cap = cv2.VideoCapture(0)
+    
+    det = Haar5ptDetector(
+        min_size=(70, 70),
+        smooth_alpha=0.80,
+        debug=False,
+    )
+    
+    emb_model = ArcFaceEmbedderONNX(
+        model_path="models/embedder_arcface.onnx",
+        debug=False,
+    )
+    
+    prev_emb: Optional[np.ndarray] = None
+    
+    print("Embedding Demo running. Press 'q' to quit, 'p' to print embedding.")
+    
+    t0 = time.time()
+    frames = 0
+    fps = 0.0
+    
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+            
+        vis = frame.copy()
         
-    from detect import HaarFaceDetector
-    from landmarks import FivePtLandmarkDetector
-    from align import FaceAligner
-    
-    detector = HaarFaceDetector()
-    landmark_detector = FivePtLandmarkDetector()
-    aligner = FaceAligner()
-    embedder = ArcFaceEmbedder(model_path)
-    
-    # Load and process image
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Failed to load image: {image_path}")
-        return
+        faces = det.detect(frame, max_faces=1)
         
-    faces = detector.detect_faces(image)
-    print(f"Detected {len(faces)} faces")
-    
-    if faces:
-        landmarks_5pt = landmark_detector.detect_landmarks(image, faces[0])
-        if landmarks_5pt is not None:
-            aligned_face = aligner.align_face(image, landmarks_5pt)
-            if aligned_face is not None:
-                embedding = embedder.extract_embedding(aligned_face)
-                if embedding is not None:
-                    validation = embedder.validate_embedding(embedding)
-                    print(f"Embedding extracted successfully!")
-                    print(f"Shape: {embedding.shape}")
-                    print(f"Validation: {validation}")
-                    
-                    # Save results
-                    cv2.imwrite('test_aligned.jpg', aligned_face)
-                    np.save('test_embedding.npy', embedding)
-                    print("Saved aligned face and embedding")
-                else:
-                    print("Embedding extraction failed")
-            else:
-                print("Face alignment failed")
+        info = []
+        if faces:
+            f = faces[0]
+            
+            # draw detection
+            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
+            for (x, y) in f.kps.astype(int):
+                cv2.circle(vis, (x, y), 3, (0, 255, 0), -1)
+                
+            # align + embed
+            aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
+            res = emb_model.embed(aligned)
+            
+            info.append(f"embedding dim: {res.dim}")
+            info.append(f"norm(before L2): {res.norm_before:.2f}")
+            
+            if prev_emb is not None:
+                sim = cosine_similarity(prev_emb, res.embedding)
+                info.append(f"cos(prev,this): {sim:.3f}")
+            
+            prev_emb = res.embedding
+            
+            # aligned preview (top-right)
+            aligned_small = cv2.resize(aligned, (160, 160))
+            h, w = vis.shape[:2]
+            vis[10:170, w-170:w-10] = aligned_small
+            
+            # --------- VISUALIZATION LAYOUT ---------
+            draw_text_block(vis, info, origin=(10, 30))
+            
+            HEAT_X, HEAT_Y = 10, 220
+            CELL_SCALE = 6
+            
+            ww, hh = draw_embedding_matrix(
+                vis,
+                res.embedding,
+                top_left=(HEAT_X, HEAT_Y),
+                cell_scale=CELL_SCALE,
+                title="embedding heatmap",
+            )
+            
+            if ww > 0:
+                cv2.putText(
+                    vis,
+                    emb_preview_str(res.embedding),
+                    (HEAT_X, HEAT_Y + hh + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (200, 200, 200),
+                    2,
+                )
         else:
-            print("Landmark detection failed")
-    else:
-        print("No faces detected")
+            draw_text_block(vis, ["no face"], origin=(10, 30), color=(0, 0, 255))
+            
+        # FPS
+        frames += 1
+        dt = time.time() - t0
+        if dt >= 1.0:
+            fps = frames / dt
+            frames = 0
+            t0 = time.time()
+            
+        cv2.putText(vis, f"fps: {fps:.1f}", (10, vis.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        cv2.imshow("Face Embedding", vis)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("p") and prev_emb is not None:
+            print("[embedding]")
+            print(" dim:", prev_emb.size)
+            print(" min/max:", prev_emb.min(), prev_emb.max())
+            print(" first10:", prev_emb[:10])
+            
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1:
-        # Test on image file
-        test_embedding_image(sys.argv[1])
-    else:
-        # Test with camera
-        test_embedding()
+    main()

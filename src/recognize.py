@@ -1,429 +1,468 @@
-#!/usr/bin/env python3
+# src/recognize.py
 """
-Live face recognition module
-Implements real-time face recognition as specified in the document
-"""
+Multi-face recognition (CPU-friendly) using your now-stable pipeline:
 
-import cv2
-import numpy as np
+Haar (multi-face) -> FaceMesh 5pt (per-face ROI) -> align_face_5pt (112x112)
+-> ArcFace ONNX embedding -> cosine distance to DB -> label each face.
+
+Run:
+python -m src.recognize
+
+Keys:
+q   : quit
+r   : reload DB from disk (data/db/face_db.npz)
++/- : adjust threshold (distance) live
+d   : toggle debug overlay
+
+Notes:
+- We run FaceMesh on EACH Haar face ROI (not the full frame). This avoids the
+  “FaceMesh points not consistent with Haar box” problem and enables multi-face.
+- DB is expected from enroll: data/db/face_db.npz (name -> embedding vector)
+- Distance definition: cosine_distance = 1 - cosine_similarity.
+  Since embeddings are L2-normalized, cosine_similarity = dot(a,b).
+"""
+from __future__ import annotations
+import time
 import os
 import json
-from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import cv2
+import numpy as np
+import onnxruntime as ort
 
-class FaceRecognizer:
-    """Live face recognition system"""
-    
-    def __init__(self, data_dir="data", threshold=0.4):
-        """
-        Initialize face recognizer
-        
-        Args:
-            data_dir: Base data directory
-            threshold: Recognition threshold (cosine similarity)
-        """
-        self.data_dir = data_dir
-        self.db_dir = os.path.join(data_dir, "db")
-        self.threshold = threshold
-        
-        # Recognition parameters
-        self.temporal_window = 10  # Frames for temporal smoothing
-        self.acceptance_hold = 30  # Frames to hold recognition result
-        self.process_every_n = 3   # Process every N frames for performance
-        
-        # State variables
-        self.frame_count = 0
-        self.recent_predictions = deque(maxlen=self.temporal_window)
-        self.hold_counter = 0
-        self.held_result = None
-        
-        # Load database
-        self.database_embeddings = {}
-        self.database_metadata = {}
-        self._load_database()
-        
-        print(f"Face recognizer initialized")
-        print(f"Threshold: {self.threshold}")
-        print(f"Database: {len(self.database_embeddings)} identities")
-        
-    def _load_database(self):
-        """Load face database"""
-        db_embeddings_path = os.path.join(self.db_dir, "face_db.npz")
-        db_metadata_path = os.path.join(self.db_dir, "face_db.json")
-        
-        if os.path.exists(db_embeddings_path):
-            db_data = np.load(db_embeddings_path)
-            self.database_embeddings = {key: db_data[key] for key in db_data.files}
-            print(f"Loaded {len(self.database_embeddings)} embeddings from database")
-        else:
-            print(f"Database not found: {db_embeddings_path}")
-            
-        if os.path.exists(db_metadata_path):
-            with open(db_metadata_path, 'r') as f:
-                self.database_metadata = json.load(f)
-                
-    def recognize_face(self, embedding):
-        """
-        Recognize face from embedding
-        
-        Args:
-            embedding: Face embedding vector (512,)
-            
-        Returns:
-            tuple: (name, confidence) where name is string or None, confidence is float
-        """
-        if embedding is None or len(self.database_embeddings) == 0:
-            return None, 0.0
-            
-        best_name = None
-        best_similarity = -1.0
-        
-        # Compare with all database embeddings
-        for name, db_embedding in self.database_embeddings.items():
-            similarity = np.dot(embedding, db_embedding)
-            
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_name = name
-                
-        # Apply threshold
-        if best_similarity >= self.threshold:
-            return best_name, best_similarity
-        else:
-            return None, best_similarity
-            
-    def apply_temporal_smoothing(self, current_prediction):
-        """
-        Apply temporal smoothing to recognition results
-        
-        Args:
-            current_prediction: Current frame prediction (name, confidence)
-            
-        Returns:
-            tuple: Smoothed prediction (name, confidence)
-        """
-        self.recent_predictions.append(current_prediction)
-        
-        # Count votes for each name
-        name_votes = {}
-        confidence_sum = {}
-        
-        for name, conf in self.recent_predictions:
-            if name is not None:
-                name_votes[name] = name_votes.get(name, 0) + 1
-                confidence_sum[name] = confidence_sum.get(name, 0) + conf
-                
-        if not name_votes:
-            return None, 0.0
-            
-        # Find most voted name
-        best_name = max(name_votes.keys(), key=lambda x: name_votes[x])
-        avg_confidence = confidence_sum[best_name] / name_votes[best_name]
-        
-        # Require majority vote
-        if name_votes[best_name] >= len(self.recent_predictions) // 2:
-            return best_name, avg_confidence
-        else:
-            return None, 0.0
-            
-    def update_threshold(self, delta):
-        """Update recognition threshold"""
-        self.threshold = max(0.0, min(1.0, self.threshold + delta))
-        print(f"Threshold updated: {self.threshold:.3f}")
-        
-    def draw_recognition_result(self, image, face_bbox, name, confidence):
-        """
-        Draw recognition result on image
-        
-        Args:
-            image: Input image
-            face_bbox: Face bounding box (x, y, w, h)
-            name: Recognized name or None
-            confidence: Recognition confidence
-            
-        Returns:
-            numpy.ndarray: Image with drawn results
-        """
-        result = image.copy()
-        x, y, w, h = face_bbox
-        
-        # Draw bounding box
-        if name is not None:
-            color = (0, 255, 0)  # Green for recognized
-            label = f"{name} ({confidence:.2f})"
-        else:
-            color = (0, 0, 255)  # Red for unknown
-            label = f"Unknown ({confidence:.2f})"
-            
-        cv2.rectangle(result, (x, y), (x + w, y + h), color, 2)
-        
-        # Draw label background
-        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-        cv2.rectangle(result, (x, y - label_size[1] - 10), 
-                     (x + label_size[0], y), color, -1)
-        
-        # Draw label text
-        cv2.putText(result, label, (x, y - 5), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        return result
-        
-    def draw_confidence_bar(self, image, confidence, threshold):
-        """Draw confidence bar"""
-        bar_width = 200
-        bar_height = 20
-        bar_x = 10
-        bar_y = image.shape[0] - 40
-        
-        # Background
-        cv2.rectangle(image, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), 
-                     (50, 50, 50), -1)
-        
-        # Confidence bar
-        conf_width = int(bar_width * confidence)
-        color = (0, 255, 0) if confidence >= threshold else (0, 0, 255)
-        cv2.rectangle(image, (bar_x, bar_y), (bar_x + conf_width, bar_y + bar_height), 
-                     color, -1)
-        
-        # Threshold line
-        thresh_x = bar_x + int(bar_width * threshold)
-        cv2.line(image, (thresh_x, bar_y), (thresh_x, bar_y + bar_height), 
-                (255, 255, 255), 2)
-        
-        # Labels
-        cv2.putText(image, f"Confidence: {confidence:.3f}", (bar_x, bar_y - 5),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(image, f"Threshold: {threshold:.3f}", (bar_x + 120, bar_y - 5),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+try:
+    import mediapipe as mp
+except Exception as e:
+    mp = None
+    _MP_IMPORT_ERROR = e
 
-def live_recognition():
-    """Live face recognition with camera"""
-    print("=== Live Face Recognition ===")
-    
-    try:
-        from camera import Camera
-        from detect import HaarFaceDetector
-        from landmarks import FivePtLandmarkDetector
-        from align import FaceAligner
-        from embed import ArcFaceEmbedder
-        
-        # Check if model exists
-        model_path = "models/embedder_arcface.onnx"
-        if not os.path.exists(model_path):
-            print(f"ERROR: ArcFace model not found at {model_path}")
-            print("Please download w600k_r50.onnx and place it in the models/ directory")
-            return
-            
-        # Initialize components
-        detector = HaarFaceDetector()
-        landmark_detector = FivePtLandmarkDetector()
-        aligner = FaceAligner()
-        embedder = ArcFaceEmbedder(model_path)
-        recognizer = FaceRecognizer()
-        
-        if len(recognizer.database_embeddings) == 0:
-            print("ERROR: No enrolled faces found in database")
-            print("Please run enrollment first: python src/enroll.py")
-            return
-            
-        print("Live recognition started")
-        print("Controls:")
-        print("  +: Increase threshold")
-        print("  -: Decrease threshold")
-        print("  Q: Quit")
-        
-        with Camera() as camera:
-            while True:
-                ret, frame = camera.read_frame()
-                if not ret:
-                    print("Failed to read frame")
-                    break
-                    
-                recognizer.frame_count += 1
-                result = frame.copy()
-                
-                # Process every N frames for performance
-                if recognizer.frame_count % recognizer.process_every_n == 0:
-                    
-                    # Detect faces
-                    faces = detector.detect_faces(frame)
-                    
-                    if faces:
-                        # Process first face
-                        face_bbox = faces[0]
-                        
-                        # ROI-based detection (crop face region)
-                        x, y, w, h = face_bbox
-                        face_roi = frame[y:y+h, x:x+w]
-                        
-                        # Detect landmarks
-                        landmarks_5pt = landmark_detector.detect_landmarks(frame, face_bbox)
-                        
-                        if landmarks_5pt is not None:
-                            # Align face
-                            aligned_face = aligner.align_face(frame, landmarks_5pt)
-                            
-                            if aligned_face is not None:
-                                # Extract embedding
-                                embedding = embedder.extract_embedding(aligned_face)
-                                
-                                if embedding is not None:
-                                    # Recognize face
-                                    name, confidence = recognizer.recognize_face(embedding)
-                                    
-                                    # Apply temporal smoothing
-                                    smoothed_name, smoothed_conf = recognizer.apply_temporal_smoothing(
-                                        (name, confidence)
-                                    )
-                                    
-                                    # Apply acceptance hold
-                                    if smoothed_name is not None:
-                                        recognizer.held_result = (smoothed_name, smoothed_conf)
-                                        recognizer.hold_counter = recognizer.acceptance_hold
-                                    elif recognizer.hold_counter > 0:
-                                        recognizer.hold_counter -= 1
-                                        if recognizer.hold_counter == 0:
-                                            recognizer.held_result = None
-                                    
-                                    # Use held result if available
-                                    display_name, display_conf = recognizer.held_result or (None, confidence)
-                                    
-                                    # Draw results
-                                    result = recognizer.draw_recognition_result(
-                                        result, face_bbox, display_name, display_conf
-                                    )
-                                    
-                                    # Draw confidence bar
-                                    recognizer.draw_confidence_bar(result, confidence, recognizer.threshold)
-                                    
-                        # Draw face detection even if no landmarks
-                        if not landmarks_5pt:
-                            cv2.rectangle(result, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                            cv2.putText(result, "No landmarks", (x, y - 5),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                
-                # Display info
-                cv2.putText(result, f"Database: {len(recognizer.database_embeddings)} people", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(result, f"Threshold: {recognizer.threshold:.3f}", 
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(result, "Controls: +/- threshold, Q quit", 
-                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                
-                cv2.imshow('Live Face Recognition', result)
-                
-                # Handle keys
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('+') or key == ord('='):
-                    recognizer.update_threshold(0.05)
-                elif key == ord('-'):
-                    recognizer.update_threshold(-0.05)
-                    
-    except Exception as e:
-        print(f"Recognition failed: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        cv2.destroyAllWindows()
+# Reuse your known-good alignment method (you said alignment is OK now)
+from .haar_5pt import HaarFaceMesh5pt, align_face_5pt
+from .embed import ArcFaceEmbedderONNX
 
-def test_recognition_image(image_path):
-    """Test recognition on a single image"""
-    if not os.path.exists(image_path):
-        print(f"Image not found: {image_path}")
-        return
-        
-    from detect import HaarFaceDetector
-    from landmarks import FivePtLandmarkDetector
-    from align import FaceAligner
-    from embed import ArcFaceEmbedder
+# -------------------------
+# Data
+# -------------------------
+@dataclass
+class FaceDet:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    score: float
+    kps: np.ndarray # (5,2) float32 in FULL-frame coords
+
+@dataclass
+class MatchResult:
+    name: Optional[str]
+    distance: float
+    similarity: float
+    accepted: bool
+
+# -------------------------
+# Math helpers
+# -------------------------
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.reshape(-1).astype(np.float32)
+    b = b.reshape(-1).astype(np.float32)
+    return float(np.dot(a, b))
+
+def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    return 1.0 - cosine_similarity(a, b)
+
+def _clip_xyxy(x1: float, y1: float, x2: float, y2: float, W: int, H: int) -> Tuple[int, int, int, int]:
+    x1 = int(max(0, min(W - 1, round(x1))))
+    y1 = int(max(0, min(H - 1, round(y1))))
+    x2 = int(max(0, min(W - 1, round(x2))))
+    y2 = int(max(0, min(H - 1, round(y2))))
+    if x2 < x1: 
+        x1, x2 = x2, x1
+    if y2 < y1: 
+        y1, y2 = y2, y1
+    return x1, y1, x2, y2
+
+def _bbox_from_5pt(kps: np.ndarray, pad_x: float = 0.55, pad_y_top: float = 0.85, pad_y_bot: float = 1.15) -> np.ndarray:
+    """
+    Build a nicer face-like bbox from 5 points with asymmetric padding.
+    kps: (5,2) in full-frame coords
+    """
+    k = kps.astype(np.float32)
+    x_min = float(np.min(k[:, 0]))
+    x_max = float(np.max(k[:, 0]))
+    y_min = float(np.min(k[:, 1]))
+    y_max = float(np.max(k[:, 1]))
     
-    model_path = "models/embedder_arcface.onnx"
-    if not os.path.exists(model_path):
-        print(f"ERROR: ArcFace model not found at {model_path}")
-        return
-        
-    # Initialize components
-    detector = HaarFaceDetector()
-    landmark_detector = FivePtLandmarkDetector()
-    aligner = FaceAligner()
-    embedder = ArcFaceEmbedder(model_path)
-    recognizer = FaceRecognizer()
+    w = max(1.0, x_max - x_min)
+    h = max(1.0, y_max - y_min)
     
-    if len(recognizer.database_embeddings) == 0:
-        print("ERROR: No enrolled faces found in database")
-        return
-        
-    # Load and process image
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Failed to load image: {image_path}")
-        return
-        
-    # Process
-    faces = detector.detect_faces(image)
-    print(f"Detected {len(faces)} faces")
+    x1 = x_min - pad_x * w
+    x2 = x_max + pad_x * w
+    y1 = y_min - pad_y_top * h
+    y2 = y_max + pad_y_bot * h
     
-    if faces:
-        face_bbox = faces[0]
-        landmarks_5pt = landmark_detector.detect_landmarks(image, face_bbox)
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
+    """
+    Minimal geometry sanity:
+    - eyes not collapsed
+    - mouth generally below nose
+    """
+    k = kps.astype(np.float32)
+    le, re, no, lm, rm = k
+    eye_dist = float(np.linalg.norm(re - le))
+    if eye_dist < float(min_eye_dist):
+        return False
+    # mouth should generally be below nose
+    if not (lm[1] > no[1] and rm[1] > no[1]):
+        return False
+    return True
+
+# -------------------------
+# DB helpers
+# -------------------------
+def load_db_npz(db_path: Path) -> Dict[str, np.ndarray]:
+    if not db_path.exists():
+        return {}
+    data = np.load(str(db_path), allow_pickle=True)
+    out: Dict[str, np.ndarray] = {}
+    for k in data.files:
+        out[k] = np.asarray(data[k], dtype=np.float32).reshape(-1)
+    return out
+
+# -------------------------
+# Multi-face Haar + FaceMesh(ROI) 5pt
+# -------------------------
+class HaarFaceMesh5pt:
+    def __init__(
+        self,
+        haar_xml: Optional[str] = None,
+        min_size: Tuple[int, int] = (60, 60),
+        debug: bool = False,
+    ):
+        self.debug = bool(debug)
+        self.min_size = tuple(map(int, min_size))
         
-        if landmarks_5pt is not None:
-            aligned_face = aligner.align_face(image, landmarks_5pt)
+        if haar_xml is None:
+            haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        self.face_cascade = cv2.CascadeClassifier(haar_xml)
+        if self.face_cascade.empty():
+            raise RuntimeError(f"Failed to load Haar cascade: {haar_xml}")
             
-            if aligned_face is not None:
-                embedding = embedder.extract_embedding(aligned_face)
+        if mp is None:
+            raise RuntimeError(
+                f"mediapipe import failed: {_MP_IMPORT_ERROR}\n"
+                f"Install: pip install mediapipe"
+            )
+        
+        # Tasks API
+        try:
+            BaseOptions = mp.tasks.BaseOptions
+            FaceLandmarker = mp.tasks.vision.FaceLandmarker
+            FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+            VisionRunningMode = mp.tasks.vision.RunningMode
+            
+            model_path = "models/face_landmarker.task"
+            if not os.path.exists(model_path):
+                 raise RuntimeError(f"Model not found: {model_path}. Run download_mp_task.py first.")
+
+            options = FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=model_path),
+                running_mode=VisionRunningMode.IMAGE,
+                num_faces=1, # One face per ROI
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+            )
+            self.landmarker = FaceLandmarker.create_from_options(options)
+        except AttributeError:
+             raise RuntimeError("Requires MediaPipe Tasks API (Python 3.11+).")
+        
+        # 5pt indices (same as your working file)
+        self.IDX_LEFT_EYE = 33
+        self.IDX_RIGHT_EYE = 263
+        self.IDX_NOSE_TIP = 1
+        self.IDX_MOUTH_LEFT = 61
+        self.IDX_MOUTH_RIGHT = 291
+
+    def _haar_faces(self, gray: np.ndarray) -> np.ndarray:
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            flags=cv2.CASCADE_SCALE_IMAGE,
+            minSize=self.min_size,
+        )
+        if faces is None or len(faces) == 0:
+            return np.zeros((0, 4), dtype=np.int32)
+        return faces.astype(np.int32) # (x,y,w,h)
+
+    def _roi_facemesh_5pt(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
+        H, W = roi_bgr.shape[:2]
+        if H < 20 or W < 20: 
+            return None
+        
+        rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        
+        res = self.landmarker.detect(mp_image)
+        
+        if not res.face_landmarks:
+            return None
+            
+        lm = res.face_landmarks[0]
+        idxs = [self.IDX_LEFT_EYE, self.IDX_RIGHT_EYE, self.IDX_NOSE_TIP, self.IDX_MOUTH_LEFT, self.IDX_MOUTH_RIGHT]
+        
+        pts = []
+        for i in idxs:
+            p = lm[i]
+            pts.append([p.x * W, p.y * H])
+            
+        kps = np.array(pts, dtype=np.float32)
+        
+        # enforce left/right ordering
+        if kps[0, 0] > kps[1, 0]:
+            kps[[0, 1]] = kps[[1, 0]]
+        if kps[3, 0] > kps[4, 0]:
+            kps[[3, 4]] = kps[[4, 3]]
+            
+        return kps
+
+    def detect(self, frame_bgr: np.ndarray, max_faces: int = 5) -> List[FaceDet]:
+        H, W = frame_bgr.shape[:2]
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        
+        faces = self._haar_faces(gray)
+        if faces.shape[0] == 0:
+            return []
+            
+        # sort by area desc, keep top max_faces
+        areas = faces[:, 2] * faces[:, 3]
+        order = np.argsort(areas)[::-1]
+        faces = faces[order][:max_faces]
+        
+        out: List[FaceDet] = []
+        
+        for (x, y, w, h) in faces:
+            # expand ROI a bit for FaceMesh stability
+            mx, my = 0.25 * w, 0.35 * h
+            rx1, ry1, rx2, ry2 = _clip_xyxy(x - mx, y - my, x + w + mx, y + h + my, W, H)
+            
+            roi = frame_bgr[ry1:ry2, rx1:rx2]
+            kps_roi = self._roi_facemesh_5pt(roi)
+            
+            if kps_roi is None:
+                if self.debug:
+                    print("[recognize] FaceMesh none for ROI -> skip")
+                continue
                 
-                if embedding is not None:
-                    name, confidence = recognizer.recognize_face(embedding)
-                    
-                    print(f"Recognition result:")
-                    print(f"  Name: {name or 'Unknown'}")
-                    print(f"  Confidence: {confidence:.4f}")
-                    print(f"  Threshold: {recognizer.threshold:.4f}")
-                    
-                    # Draw and display result
-                    result = recognizer.draw_recognition_result(image, face_bbox, name, confidence)
-                    recognizer.draw_confidence_bar(result, confidence, recognizer.threshold)
-                    
-                    cv2.imshow('Face Recognition - Image', result)
-                    cv2.waitKey(0)
-                    cv2.destroyAllWindows()
-                else:
-                    print("Embedding extraction failed")
-            else:
-                print("Face alignment failed")
+            # map ROI kps back to full-frame coords
+            kps = kps_roi.copy()
+            kps[:, 0] += float(rx1)
+            kps[:, 1] += float(ry1)
+            
+            # sanity: eye distance relative to Haar width
+            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * float(w))):
+                if self.debug:
+                    print("[recognize] 5pt geometry failed -> skip")
+                continue
+                
+            # build bbox from kps (centered)
+            bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+            x1, y1, x2, y2 = _clip_xyxy(bb[0], bb[1], bb[2], bb[3], W, H)
+            
+            out.append(
+                FaceDet(
+                    x1=x1, y1=y1, x2=x2, y2=y2,
+                    score=1.0,
+                    kps=kps.astype(np.float32),
+                )
+            )
+            
+        return out
+
+# -------------------------
+# Matcher
+# -------------------------
+class FaceDBMatcher:
+    def __init__(self, db: Dict[str, np.ndarray], dist_thresh: float = 0.34):
+        self.db = db
+        self.dist_thresh = float(dist_thresh)
+        
+        # pre-stack for speed
+        self._names: List[str] = []
+        self._mat: Optional[np.ndarray] = None
+        self._rebuild()
+        
+    def _rebuild(self):
+        self._names = sorted(self.db.keys())
+        if self._names:
+            self._mat = np.stack([self.db[n].reshape(-1).astype(np.float32) for n in self._names], axis=0) 
+            # (K,D)
         else:
-            print("Landmark detection failed")
-    else:
-        print("No faces detected")
+            self._mat = None
+            
+    def reload_from(self, path: Path):
+        self.db = load_db_npz(path)
+        self._rebuild()
+        
+    def match(self, emb: np.ndarray) -> MatchResult:
+        if self._mat is None or len(self._names) == 0:
+            return MatchResult(name=None, distance=1.0, similarity=0.0, accepted=False)
+            
+        e = emb.reshape(1, -1).astype(np.float32) # (1,D)
+        
+        # cosine similarity since both sides are normalized: sim = dot
+        sims = (self._mat @ e.T).reshape(-1) # (K,)
+        best_i = int(np.argmax(sims))
+        best_sim = float(sims[best_i])
+        best_dist = 1.0 - best_sim
+        
+        ok = best_dist <= self.dist_thresh
+        
+        return MatchResult(
+            name=self._names[best_i] if ok else None,
+            distance=float(best_dist),
+            similarity=float(best_sim),
+            accepted=bool(ok),
+        )
 
+# -------------------------
+# Demo
+# -------------------------
 def main():
-    """Main recognition interface"""
-    print("=== Face Recognition System ===")
-    print("1. Live recognition (camera)")
-    print("2. Test on image file")
-    print("3. Quit")
+    db_path = Path("data/db/face_db.npz")
     
-    choice = input("Choose option: ").strip()
+    det = HaarFaceMesh5pt(
+        min_size=(60, 60),
+        debug=False,
+    )
     
-    if choice == '1':
-        live_recognition()
-    elif choice == '2':
-        image_path = input("Enter image path: ").strip()
-        if image_path:
-            test_recognition_image(image_path)
-    elif choice == '3':
-        pass
-    else:
-        print("Invalid choice")
+    embedder = ArcFaceEmbedderONNX(
+        model_path="models/embedder_arcface.onnx",
+        input_size=(112, 112),
+        debug=False,
+    )
+    
+    db = load_db_npz(db_path)
+    matcher = FaceDBMatcher(db=db, dist_thresh=0.34) # from your evaluate_new output
+    
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Camera not available")
+        
+    print("Recognize (multi-face). q=quit, r=reload DB, +/- threshold, d=debug overlay")
+    
+    t0 = time.time()
+    frames = 0
+    fps: Optional[float] = None
+    show_debug = False
+    
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+            
+        faces = det.detect(frame, max_faces=5)
+        vis = frame.copy()
+        
+        # compute fps
+        frames += 1
+        dt = time.time() - t0
+        if dt >= 1.0:
+            fps = frames / dt
+            frames = 0
+            t0 = time.time()
+            
+        # draw + recognize each face
+        
+        # show aligned thumbnails stacked on the RIGHT, but lower to avoid overlay with green text
+        h, w = vis.shape[:2]
+        thumb = 112
+        pad = 8
+        x0 = w - thumb - pad
+        y0 = 80 # moved down to avoid your text overlay area
+        shown = 0
+        
+        for i, f in enumerate(faces):
+            # draw bbox + kps
+            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
+            for (x, y) in f.kps.astype(int):
+                cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
+                
+            # align -> embed -> match
+            aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
+            emb = embedder.embed(aligned)
+            mr = matcher.match(emb.embedding)
+            
+            # label
+            label = mr.name if mr.name is not None else "Unknown"
+            line1 = f"{label}"
+            line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
+            
+            # color: known green, unknown red
+            color = (0, 255, 0) if mr.accepted else (0, 0, 255)
+            
+            cv2.putText(vis, line1, (f.x1, max(0, f.y1 - 28)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # aligned preview thumbnails (stack)
+            if y0 + thumb <= h and shown < 4:
+                vis[y0:y0 + thumb, x0:x0 + thumb] = aligned
+                cv2.putText(
+                    vis,
+                    color,
+                    2,
+                )
+                y0 += thumb + pad
+                shown += 1
+
+            # Confidence bar (similarity)
+            bar_w = 100
+            bar_h = 10
+            bar_x = f.x1
+            bar_y = max(0, f.y1 - 5) - bar_h # above text/box
+            
+            # background (black)
+            cv2.rectangle(vis, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (0, 0, 0), -1)
+            # fill (similarity)
+            sim_w = int(mr.similarity * bar_w)
+            cv2.rectangle(vis, (bar_x, bar_y), (bar_x + sim_w, bar_y + bar_h), color, -1)
+            # border
+            cv2.rectangle(vis, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 1)
+                
+            if show_debug:
+                # show kps coords quickly
+                dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
+                cv2.putText(vis, dbg, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # overlay header
+        header = f"IDs={len(matcher._names)} thr(dist)={matcher.dist_thresh:.2f}"
+        if fps is not None:
+            header += f" fps={fps:.1f}"
+        cv2.putText(vis, header, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        
+        cv2.imshow("recognize_new", vis)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("r"):
+            matcher.reload_from(db_path)
+            print(f"[recognize] reloaded DB: {len(matcher._names)} identities")
+        elif key in (ord("+"), ord("=")):
+            matcher.dist_thresh = float(min(1.20, matcher.dist_thresh + 0.01))
+            print(f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})")
+        elif key == ord("-"):
+            matcher.dist_thresh = float(max(0.05, matcher.dist_thresh - 0.01))
+            print(f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})")
+        elif key == ord("d"):
+            show_debug = not show_debug
+            print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
+            
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1:
-        # Test on image file
-        test_recognition_image(sys.argv[1])
-    else:
-        # Interactive mode
-        main()
+    main()

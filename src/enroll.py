@@ -1,380 +1,319 @@
-#!/usr/bin/env python3
+# src/enroll.py
 """
-Face enrollment module for creating reference database
-Implements enrollment pipeline as specified in the document
-"""
+enroll.py
+Enrollment tool using your working pipeline:
+camera -> Haar detection -> FaceMesh 5pt -> align_face_5pt (112x112) -> ArcFace embedding
+Stores template per identity (mean embedding, L2-normalized).
 
+Re-enroll behavior:
+- If data/enroll/<name> already contains aligned crops, those are loaded,
+  embedded again, and INCLUDED in the template. New captures are appended.
+
+Outputs:
+- data/db/face_db.npz (name -> embedding vector)
+- data/db/face_db.json (metadata)
+
+Optional:
+- data/enroll/<name>/*.jpg aligned face crops
+
+Controls:
+- SPACE: capture one sample (if face found)
+- a: auto-capture toggle (captures periodically)
+- s: save enrollment (after enough total samples)
+- r: reset NEW samples (keeps existing crops on disk)
+- q: quit
+"""
+from __future__ import annotations
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-import os
-import json
-from datetime import datetime
 
-class FaceEnroller:
-    """Face enrollment system for building reference database"""
+from .haar_5pt import Haar5ptDetector, align_face_5pt
+from .embed import ArcFaceEmbedderONNX
+
+# -------------------------
+# Config
+# -------------------------
+@dataclass
+class EnrollConfig:
+    out_db_npz: Path = Path("data/db/face_db.npz")
+    out_db_json: Path = Path("data/db/face_db.json")
     
-    def __init__(self, data_dir="data"):
-        """
-        Initialize face enroller
-        
-        Args:
-            data_dir: Base data directory
-        """
-        self.data_dir = data_dir
-        self.enroll_dir = os.path.join(data_dir, "enroll")
-        self.db_dir = os.path.join(data_dir, "db")
-        
-        # Ensure directories exist
-        os.makedirs(self.enroll_dir, exist_ok=True)
-        os.makedirs(self.db_dir, exist_ok=True)
-        
-        # Database files
-        self.db_embeddings_path = os.path.join(self.db_dir, "face_db.npz")
-        self.db_metadata_path = os.path.join(self.db_dir, "face_db.json")
-        
-        # Enrollment parameters
-        self.min_samples = 3
-        self.max_samples = 10
-        self.quality_threshold = 0.5
-        
-        print(f"Face enroller initialized")
-        print(f"Enroll directory: {self.enroll_dir}")
-        print(f"Database directory: {self.db_dir}")
-        
-    def enroll_person(self, name, embeddings, aligned_faces=None, save_crops=True):
-        """
-        Enroll a person with multiple face samples
-        
-        Args:
-            name: Person's name/identifier
-            embeddings: List of embedding vectors
-            aligned_faces: List of aligned face images (optional)
-            save_crops: Whether to save aligned face crops
-            
-        Returns:
-            bool: Success status
-        """
-        if len(embeddings) < self.min_samples:
-            print(f"ERROR: Need at least {self.min_samples} samples, got {len(embeddings)}")
-            return False
-            
-        try:
-            # Create person directory
-            person_dir = os.path.join(self.enroll_dir, name)
-            os.makedirs(person_dir, exist_ok=True)
-            
-            # Validate embeddings
-            valid_embeddings = []
-            valid_faces = []
-            
-            for i, embedding in enumerate(embeddings):
-                if embedding is not None and embedding.shape == (512,):
-                    valid_embeddings.append(embedding)
-                    if aligned_faces and i < len(aligned_faces):
-                        valid_faces.append(aligned_faces[i])
-                        
-            if len(valid_embeddings) < self.min_samples:
-                print(f"ERROR: Only {len(valid_embeddings)} valid embeddings")
-                return False
-                
-            # Compute mean embedding
-            embeddings_array = np.array(valid_embeddings)
-            mean_embedding = np.mean(embeddings_array, axis=0)
-            
-            # L2 normalize mean embedding
-            mean_embedding = mean_embedding / np.linalg.norm(mean_embedding)
-            
-            # Save aligned face crops if requested
-            if save_crops and valid_faces:
-                for i, face in enumerate(valid_faces):
-                    if face is not None:
-                        crop_path = os.path.join(person_dir, f"{name}_{i:03d}.jpg")
-                        cv2.imwrite(crop_path, face)
-                        
-            # Update database
-            self._update_database(name, mean_embedding, valid_embeddings)
-            
-            print(f"Successfully enrolled {name} with {len(valid_embeddings)} samples")
-            return True
-            
-        except Exception as e:
-            print(f"Enrollment failed for {name}: {e}")
-            return False
-            
-    def _update_database(self, name, mean_embedding, all_embeddings):
-        """Update face database with new person"""
-        
-        # Load existing database
-        db_embeddings = {}
-        db_metadata = {}
-        
-        if os.path.exists(self.db_embeddings_path):
-            db_data = np.load(self.db_embeddings_path)
-            db_embeddings = {key: db_data[key] for key in db_data.files}
-            
-        if os.path.exists(self.db_metadata_path):
-            with open(self.db_metadata_path, 'r') as f:
-                db_metadata = json.load(f)
-                
-        # Add/update person
-        db_embeddings[name] = mean_embedding
-        db_metadata[name] = {
-            'num_samples': len(all_embeddings),
-            'enrollment_date': datetime.now().isoformat(),
-            'embedding_dim': mean_embedding.shape[0],
-            'embedding_norm': float(np.linalg.norm(mean_embedding))
-        }
-        
-        # Save updated database
-        np.savez(self.db_embeddings_path, **db_embeddings)
-        
-        with open(self.db_metadata_path, 'w') as f:
-            json.dump(db_metadata, f, indent=2)
-            
-        print(f"Database updated: {len(db_embeddings)} identities")
-        
-    def load_database(self):
-        """
-        Load face database
-        
-        Returns:
-            tuple: (embeddings_dict, metadata_dict)
-        """
-        embeddings = {}
-        metadata = {}
-        
-        if os.path.exists(self.db_embeddings_path):
-            db_data = np.load(self.db_embeddings_path)
-            embeddings = {key: db_data[key] for key in db_data.files}
-            
-        if os.path.exists(self.db_metadata_path):
-            with open(self.db_metadata_path, 'r') as f:
-                metadata = json.load(f)
-                
-        return embeddings, metadata
-        
-    def list_enrolled_people(self):
-        """List all enrolled people"""
-        embeddings, metadata = self.load_database()
-        
-        print(f"\nEnrolled people ({len(embeddings)}):")
-        for name in embeddings.keys():
-            info = metadata.get(name, {})
-            print(f"  {name}: {info.get('num_samples', 'N/A')} samples, "
-                  f"enrolled {info.get('enrollment_date', 'unknown')}")
-                  
-        return list(embeddings.keys())
-        
-    def delete_person(self, name):
-        """Delete a person from database"""
-        embeddings, metadata = self.load_database()
-        
-        if name not in embeddings:
-            print(f"Person {name} not found in database")
-            return False
-            
-        # Remove from database
-        del embeddings[name]
-        if name in metadata:
-            del metadata[name]
-            
-        # Save updated database
-        np.savez(self.db_embeddings_path, **embeddings)
-        with open(self.db_metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-            
-        # Remove enrollment directory
-        person_dir = os.path.join(self.enroll_dir, name)
-        if os.path.exists(person_dir):
-            import shutil
-            shutil.rmtree(person_dir)
-            
-        print(f"Deleted {name} from database")
-        return True
+    save_crops: bool = True
+    crops_dir: Path = Path("data/enroll")
+    
+    samples_needed: int = 15
+    auto_capture_every_s: float = 0.25
+    max_existing_crops: int = 300
+    
+    # UI
+    window_main: str = "enroll"
+    window_aligned: str = "aligned_112"
 
-def interactive_enrollment():
-    """Interactive enrollment using camera"""
-    print("=== Face Enrollment System ===")
+# -------------------------
+# DB helpers
+# -------------------------
+def ensure_dirs(cfg: EnrollConfig) -> None:
+    cfg.out_db_npz.parent.mkdir(parents=True, exist_ok=True)
+    cfg.out_db_json.parent.mkdir(parents=True, exist_ok=True)
+    if cfg.save_crops:
+        cfg.crops_dir.mkdir(parents=True, exist_ok=True)
+
+def load_db(cfg: EnrollConfig) -> Dict[str, np.ndarray]:
+    if cfg.out_db_npz.exists():
+        data = np.load(cfg.out_db_npz, allow_pickle=True)
+        return {k: data[k].astype(np.float32) for k in data.files}
+    return {}
+
+def save_db(cfg: EnrollConfig, db: Dict[str, np.ndarray], meta: dict) -> None:
+    ensure_dirs(cfg)
+    np.savez(cfg.out_db_npz, **{k: v.astype(np.float32) for k, v in db.items()})
+    cfg.out_db_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+def mean_embedding(embeddings: List[np.ndarray]) -> np.ndarray:
+    """Mean + L2 normalize."""
+    E = np.stack([e.reshape(-1) for e in embeddings], axis=0).astype(np.float32)
+    m = E.mean(axis=0)
+    m = m / (np.linalg.norm(m) + 1e-12)
+    return m.astype(np.float32)
+
+# -------------------------
+# Crops loader
+# -------------------------
+def _list_existing_crops(person_dir: Path, max_count: int) -> List[Path]:
+    if not person_dir.exists():
+        return []
+    files = sorted([p for p in person_dir.glob("*.jpg") if p.is_file()])
+    if len(files) > max_count:
+        files = files[-max_count:]
+    return files
+
+def load_existing_samples_from_crops(
+    cfg: EnrollConfig,
+    emb: ArcFaceEmbedderONNX,
+    person_dir: Path,
+) -> List[np.ndarray]:
+    """
+    Reads aligned crops from disk and re-embeds them.
+    """
+    if not cfg.save_crops:
+        return []
+        
+    crops = _list_existing_crops(person_dir, cfg.max_existing_crops)
+    base: List[np.ndarray] = []
+    
+    for p in crops:
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+        try:
+            r = emb.embed(img)
+            base.append(r.embedding)
+        except Exception:
+            continue
+            
+    return base
+
+# -------------------------
+# UI helpers
+# -------------------------
+def draw_status(
+    frame: np.ndarray, 
+    name: str, 
+    base_count: int, 
+    new_count: int, 
+    needed: int,
+    auto: bool,
+    msg: str = "",
+) -> None:
+    total = base_count + new_count
+    lines = [
+        f"ENROLL: {name}",
+        f"Existing: {base_count} | New: {new_count} | Total: {total} / {needed}",
+        f"Auto: {'ON' if auto else 'OFF'} (toggle: a)",
+        "SPACE=capture | s=save | r=reset NEW | q=quit",
+    ]
+    if msg:
+        lines.insert(0, msg)
+        
+    # draw with black shadow for readability
+    y = 30
+    for line in lines:
+        cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+        y += 26
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    cfg = EnrollConfig()
+    ensure_dirs(cfg)
+    
+    name = input("Enter person name to enroll (e.g., Alice): ").strip()
+    if not name:
+        print("No name provided. Exiting.")
+        return
+
+    # Pipeline (your working practical stack)
+    det = Haar5ptDetector(min_size=(60, 60), smooth_alpha=0.80, debug=False)
+    emb = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", input_size=(112, 112), debug=False)
+    
+    db = load_db(cfg)
+    
+    person_dir = cfg.crops_dir / name
+    if cfg.save_crops:
+        person_dir.mkdir(parents=True, exist_ok=True)
+        
+    base_samples: List[np.ndarray] = load_existing_samples_from_crops(cfg, emb, person_dir)
+    new_samples: List[np.ndarray] = []
+    
+    status_msg = ""
+    if base_samples:
+        status_msg = f"Loaded {len(base_samples)} existing samples from disk."
+        
+    auto = False
+    last_auto = 0.0
+    
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Failed to open camera.")
+
+    cv2.namedWindow(cfg.window_main, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(cfg.window_aligned, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(cfg.window_aligned, 240, 240)
+    
+    print("\nEnrollment started.")
+    if base_samples:
+        print(f"Re-enroll mode: found {len(base_samples)} existing samples in {person_dir}/")
+    print("Tip: stable lighting, move slightly left/right, different expressions.")
+    print("Controls: SPACE=capture, a=auto, s=save, r=reset NEW, q=quit\n")
+    
+    t0 = time.time()
+    frames = 0
+    fps: Optional[float] = None
     
     try:
-        from camera import Camera
-        from detect import HaarFaceDetector
-        from landmarks import FivePtLandmarkDetector
-        from align import FaceAligner
-        from embed import ArcFaceEmbedder
-        
-        # Check if model exists
-        model_path = "models/embedder_arcface.onnx"
-        if not os.path.exists(model_path):
-            print(f"ERROR: ArcFace model not found at {model_path}")
-            print("Please download w600k_r50.onnx and place it in the models/ directory")
-            return
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
             
-        # Initialize components
-        detector = HaarFaceDetector()
-        landmark_detector = FivePtLandmarkDetector()
-        aligner = FaceAligner()
-        embedder = ArcFaceEmbedder(model_path)
-        enroller = FaceEnroller()
-        
-        # Get person name
-        name = input("Enter person's name: ").strip()
-        if not name:
-            print("Invalid name")
-            return
+            vis = frame.copy()
+            faces = det.detect(frame, max_faces=1)
             
-        print(f"\nEnrolling: {name}")
-        print("Controls:")
-        print("  SPACE: Capture sample")
-        print("  A: Auto-capture mode")
-        print("  S: Save enrollment")
-        print("  R: Reset samples")
-        print("  Q: Quit")
-        
-        # Enrollment state
-        samples = []
-        aligned_faces = []
-        auto_capture = False
-        auto_counter = 0
-        
-        with Camera() as camera:
-            while True:
-                ret, frame = camera.read_frame()
-                if not ret:
-                    print("Failed to read frame")
-                    break
-                    
-                # Process frame
-                faces = detector.detect_faces(frame)
-                landmarks_5pt = None
-                aligned_face = None
-                embedding = None
+            aligned: Optional[np.ndarray] = None
+            
+            if faces:
+                f = faces[0]
                 
-                if faces:
-                    landmarks_5pt = landmark_detector.detect_landmarks(frame, faces[0])
-                    if landmarks_5pt is not None:
-                        aligned_face = aligner.align_face(frame, landmarks_5pt)
-                        if aligned_face is not None:
-                            embedding = embedder.extract_embedding(aligned_face)
+                # draw bbox + kps
+                cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
+                for (x, y) in f.kps.astype(int):
+                    cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
                 
-                # Auto-capture logic
-                if auto_capture and embedding is not None and len(samples) < enroller.max_samples:
-                    auto_counter += 1
-                    if auto_counter >= 30:  # Capture every 30 frames (~1 second)
-                        samples.append(embedding)
-                        aligned_faces.append(aligned_face.copy())
-                        auto_counter = 0
-                        print(f"Auto-captured sample {len(samples)}")
+                aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
+                cv2.imshow(cfg.window_aligned, aligned)
+            else:
+                cv2.imshow(cfg.window_aligned, np.zeros((112, 112, 3), dtype=np.uint8))
+            
+            # auto capture
+            now = time.time()
+            if auto and aligned is not None and (now - last_auto) >= cfg.auto_capture_every_s:
+                r = emb.embed(aligned)
+                new_samples.append(r.embedding)
+                last_auto = now
+                status_msg = f"Auto captured NEW ({len(new_samples)})"
                 
-                # Draw results
-                result = detector.draw_faces(frame, faces, color=(255, 0, 0))
-                if landmarks_5pt is not None:
-                    result = landmark_detector.draw_landmarks(result, landmarks_5pt)
+                if cfg.save_crops:
+                    fn = person_dir / f"{int(now * 1000)}.jpg"
+                    cv2.imwrite(str(fn), aligned)
+            
+            # FPS
+            frames += 1
+            dt = time.time() - t0
+            if dt >= 1.0:
+                fps = frames / dt
+                frames = 0
+                t0 = time.time()
+            
+            if fps is not None:
+                cv2.putText(vis, f"FPS: {fps:.1f}", (10, vis.shape[0] - 12), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            
+            draw_status(
+                vis,
+                name=name,
+                base_count=len(base_samples),
+                new_count=len(new_samples),
+                needed=cfg.samples_needed,
+                auto=auto,
+                msg=status_msg,
+            )
+            
+            cv2.imshow(cfg.window_main, vis)
+            
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord("q"):
+                break
+            
+            if key == ord("a"):
+                auto = not auto
+                status_msg = f"Auto mode {'ON' if auto else 'OFF'}"
                 
-                # Display info
-                cv2.putText(result, f"Enrolling: {name}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(result, f"Samples: {len(samples)}/{enroller.max_samples}", (10, 70),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                if auto_capture:
-                    cv2.putText(result, "AUTO-CAPTURE ON", (10, 110),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                
-                if embedding is not None:
-                    cv2.putText(result, "Ready to capture", (10, 150),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                else:
-                    cv2.putText(result, "No face detected", (10, 150),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                # Show controls
-                cv2.putText(result, "SPACE:Capture A:Auto S:Save R:Reset Q:Quit", (10, 400),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                
-                cv2.imshow('Face Enrollment', result)
-                
-                # Show aligned face if available
-                if aligned_face is not None:
-                    aligned_display = cv2.resize(aligned_face, (224, 224), interpolation=cv2.INTER_NEAREST)
-                    cv2.imshow('Aligned Face', aligned_display)
-                
-                # Handle keys
-                key = cv2.waitKey(1) & 0xFF
-                
-                if key == ord('q'):
-                    break
-                elif key == ord(' ') and embedding is not None:
-                    # Manual capture
-                    if len(samples) < enroller.max_samples:
-                        samples.append(embedding)
-                        aligned_faces.append(aligned_face.copy())
-                        print(f"Captured sample {len(samples)}")
-                    else:
-                        print("Maximum samples reached")
-                elif key == ord('a'):
-                    # Toggle auto-capture
-                    auto_capture = not auto_capture
-                    auto_counter = 0
-                    print(f"Auto-capture: {'ON' if auto_capture else 'OFF'}")
-                elif key == ord('s'):
-                    # Save enrollment
-                    if len(samples) >= enroller.min_samples:
-                        success = enroller.enroll_person(name, samples, aligned_faces)
-                        if success:
-                            print(f"Successfully enrolled {name}!")
-                            break
-                        else:
-                            print("Enrollment failed")
-                    else:
-                        print(f"Need at least {enroller.min_samples} samples")
-                elif key == ord('r'):
-                    # Reset samples
-                    samples = []
-                    aligned_faces = []
-                    auto_capture = False
-                    print("Samples reset")
-                    
-    except Exception as e:
-        print(f"Enrollment failed: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        cv2.destroyAllWindows()
+            if key == ord("r"):
+                new_samples.clear()
+                status_msg = "NEW samples reset (existing kept)."
 
-def main():
-    """Main enrollment interface"""
-    enroller = FaceEnroller()
-    
-    while True:
-        print("\n=== Face Enrollment System ===")
-        print("1. Interactive enrollment (camera)")
-        print("2. List enrolled people")
-        print("3. Delete person")
-        print("4. Database info")
-        print("5. Quit")
-        
-        choice = input("Choose option: ").strip()
-        
-        if choice == '1':
-            interactive_enrollment()
-        elif choice == '2':
-            enroller.list_enrolled_people()
-        elif choice == '3':
-            name = input("Enter name to delete: ").strip()
-            if name:
-                enroller.delete_person(name)
-        elif choice == '4':
-            embeddings, metadata = enroller.load_database()
-            print(f"\nDatabase info:")
-            print(f"  Total identities: {len(embeddings)}")
-            print(f"  Database files:")
-            print(f"    {enroller.db_embeddings_path}")
-            print(f"    {enroller.db_metadata_path}")
-        elif choice == '5':
-            break
-        else:
-            print("Invalid choice")
+            if key == ord(" "): # SPACE
+                if aligned is None:
+                    status_msg = "No face detected. Not captured."
+                else:
+                    r = emb.embed(aligned)
+                    new_samples.append(r.embedding)
+                    status_msg = f"Captured NEW ({len(new_samples)})"
+                    
+                    if cfg.save_crops:
+                        fn = person_dir / f"{int(time.time() * 1000)}.jpg"
+                        cv2.imwrite(str(fn), aligned)
+
+            if key == ord("s"):
+                total = len(base_samples) + len(new_samples)
+                if total < max(3, cfg.samples_needed // 2):
+                    status_msg = f"Not enough total samples to save (have {total})."
+                    continue
+                    
+                all_samples = base_samples + new_samples
+                template = mean_embedding(all_samples)
+                db[name] = template
+                
+                meta = {
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "embedding_dim": int(template.size),
+                    "names": sorted(db.keys()),
+                    "samples_existing_used": int(len(base_samples)),
+                    "samples_new_used": int(len(new_samples)),
+                    "samples_total_used": int(len(all_samples)),
+                    "note": "Embeddings are L2-normalized vectors. Matching uses cosine similarity.",
+                }
+                
+                save_db(cfg, db, meta)
+                
+                status_msg = f"Saved '{name}' to DB. Total identities: {len(db)}"
+                print(status_msg)
+                
+                # reload base from disk so UI matches reality
+                base_samples = load_existing_samples_from_crops(cfg, emb, person_dir)
+                new_samples.clear()
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()

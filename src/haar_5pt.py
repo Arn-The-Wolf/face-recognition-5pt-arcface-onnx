@@ -1,400 +1,380 @@
-#!/usr/bin/env python3
+# src/haar_5pt.py
 """
-Combined Haar detection + 5-point landmarks module
-Integrates face detection and landmark detection as specified in the document
-"""
+Haar face detection + practical 5-point landmarks (MediaPipe FaceMesh).
 
+Why this works for you:
+- Haar is fast and robust on CPU.
+- MediaPipe FaceMesh confirms a real face and gives stable landmarks.
+- We extract ONLY 5 keypoints: left_eye, right_eye, nose_tip, mouth_left, mouth_right
+- We rebuild bbox from keypoints (centered), so no "aside" offset.
+- We reject Haar false positives if FaceMesh doesn't produce landmarks.
+
+Run:
+python -m src.haar_5pt
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
 import cv2
+import os
 import numpy as np
 
-class HaarFivePtDetector:
-    """Combined Haar face detection + MediaPipe 5-point landmarks"""
+try:
+    import mediapipe as mp
+except Exception as e:
+    mp = None
+    _MP_IMPORT_ERROR = e
+
+# -------------------------
+# Data
+# -------------------------
+@dataclass
+class FaceKpsBox:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    score: float
+    kps: np.ndarray # (5,2) float32
+
+# -------------------------
+# Helpers
+# -------------------------
+def _estimate_norm_5pt(kps_5x2: np.ndarray, out_size: Tuple[int, int] = (112, 112)) -> np.ndarray:
+    """
+    Build 2x3 affine matrix that maps your 5pts to ArcFace-style template.
+    kps order must be: [Leye, Reye, Nose, Lmouth, Rmouth]
+    """
+    k = kps_5x2.astype(np.float32)
+    # ArcFace 112x112 template (InsightFace standard)
+    # Works well for ArcFace embedder models expecting 112x112
+    dst = np.array([
+        [38.2946, 51.6963], # left eye
+        [73.5318, 51.5014], # right eye
+        [56.0252, 71.7366], # nose
+        [41.5493, 92.3655], # left mouth
+        [70.7299, 92.2041], # right mouth
+    ], dtype=np.float32)
+
+    out_w, out_h = int(out_size[0]), int(out_size[1])
+
+    # If you choose a different output size, scale template
+    if (out_w, out_h) != (112, 112):
+        sx = out_w / 112.0
+        sy = out_h / 112.0
+        dst = dst * np.array([sx, sy], dtype=np.float32)
+
+    # Similarity transform (rotation+scale+translation)
+    M, _ = cv2.estimateAffinePartial2D(k, dst, method=cv2.LMEDS)
     
-    def __init__(self):
-        """Initialize combined detector"""
-        from detect import HaarFaceDetector
-        from landmarks import FivePtLandmarkDetector
+    if M is None:
+        # use eyes only
+        M = cv2.getAffineTransform(
+            np.array([k[0], k[1], k[2]], dtype=np.float32),
+            np.array([dst[0], dst[1], dst[2]], dtype=np.float32),
+        )
         
-        self.face_detector = HaarFaceDetector()
-        self.landmark_detector = FivePtLandmarkDetector()
+    return M.astype(np.float32)
+
+def align_face_5pt(
+    frame_bgr: np.ndarray,
+    kps_5x2: np.ndarray,
+    out_size: Tuple[int, int] = (112, 112)
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (aligned_bgr, M)
+    """
+    M = _estimate_norm_5pt(kps_5x2, out_size=out_size)
+    out_w, out_h = int(out_size[0]), int(out_size[1])
+    aligned = cv2.warpAffine(
+        frame_bgr,
+        M,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    return aligned, M
+
+def _clip_box_xyxy(b: np.ndarray, W: int, H: int) -> np.ndarray:
+    bb = b.astype(np.float32).copy()
+    bb[0] = np.clip(bb[0], 0, W - 1)
+    bb[1] = np.clip(bb[1], 0, H - 1)
+    bb[2] = np.clip(bb[2], 0, W - 1)
+    bb[3] = np.clip(bb[3], 0, H - 1)
+    return bb
+
+def _bbox_from_5pt(kps: np.ndarray, pad_x: float = 0.55, pad_y_top: float = 0.85, pad_y_bot: float = 1.15) -> np.ndarray:
+    """
+    Build a face bbox from 5 keypoints with asymmetric padding:
+     - more forehead (top)
+     - more chin (bottom)
+    This tends to look "centered" and face-like.
+    """
+    k = kps.astype(np.float32)
+    x_min = float(np.min(k[:, 0]))
+    x_max = float(np.max(k[:, 0]))
+    y_min = float(np.min(k[:, 1]))
+    y_max = float(np.max(k[:, 1]))
+
+    w = max(1.0, x_max - x_min)
+    h = max(1.0, y_max - y_min)
+
+    x1 = x_min - pad_x * w
+    x2 = x_max + pad_x * w
+    y1 = y_min - pad_y_top * h
+    y2 = y_max + pad_y_bot * h
+
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+def _ema(prev: Optional[np.ndarray], cur: np.ndarray, alpha: float) -> np.ndarray:
+    if prev is None:
+        return cur.astype(np.float32)
+    return (alpha * prev + (1.0 - alpha) * cur).astype(np.float32)
+
+def _kps_span_ok(kps: np.ndarray, min_eye_dist: float = 12.0) -> bool:
+    """
+    Quick sanity filter on 5pt geometry:
+    - eye distance must be reasonable
+    - mouth should be below eyes (usually)
+    """
+    k = kps.astype(np.float32)
+    le, re, no, lm, rm = k
+    eye_dist = float(np.linalg.norm(re - le))
+    if eye_dist < min_eye_dist:
+        return False
+    # mouth should generally be below nose
+    if not (lm[1] > no[1] and rm[1] > no[1]):
+        return False
+    return True
+
+# -------------------------
+# Detector
+# -------------------------
+class Haar5ptDetector:
+    def __init__(
+        self,
+        haar_xml: Optional[str] = None,
+        min_size: Tuple[int, int] = (60, 60),
+        smooth_alpha: float = 0.80,
+        debug: bool = True,
+    ):
+        self.debug = bool(debug)
+        self.min_size = tuple(map(int, min_size))
+        self.smooth_alpha = float(smooth_alpha)
         
-        print("Combined Haar + 5-point detector initialized")
-        
-    def detect_faces_and_landmarks(self, image, return_largest=True):
-        """
-        Detect faces and extract 5-point landmarks
-        
-        Args:
-            image: Input image (BGR)
-            return_largest: If True, return only the largest face
+        # Haar cascade
+        if haar_xml is None:
+            haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        self.face_cascade = cv2.CascadeClassifier(haar_xml)
+        if self.face_cascade.empty():
+            raise RuntimeError(f"Failed to load Haar cascade: {haar_xml}")
+
+        if mp is None:
+            raise RuntimeError(
+                f"mediapipe import failed: {_MP_IMPORT_ERROR}\n"
+                f"Install: pip install mediapipe"
+            )
+
+        # MediaPipe Tasks API (Python 3.13 compatible)
+        try:
+            BaseOptions = mp.tasks.BaseOptions
+            FaceLandmarker = mp.tasks.vision.FaceLandmarker
+            FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+            VisionRunningMode = mp.tasks.vision.RunningMode
             
-        Returns:
-            list: List of (face_bbox, landmarks_5pt) tuples
-                  face_bbox: (x, y, w, h)
-                  landmarks_5pt: 5x2 array or None if detection failed
-        """
-        # Detect faces
-        faces = self.face_detector.detect_faces(image)
+            model_path = "models/face_landmarker.task"
+            if not os.path.exists(model_path):
+                 raise RuntimeError(f"Model not found: {model_path}. Run download_mp_task.py first.")
+
+            options = FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=model_path),
+                running_mode=VisionRunningMode.IMAGE,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+            )
+            self.landmarker = FaceLandmarker.create_from_options(options)
+            
+        except AttributeError:
+             # Fallback for old MediaPipe if solutions exists (but we know it doesn't here)
+             raise RuntimeError("This script requires MediaPipe Tasks API (Python 3.11+ style) but failed to init.")
         
-        if not faces:
+        # FaceMesh landmark indices for 5 points | (commonly used set; works well in practice)
+        self.IDX_LEFT_EYE = 33
+        self.IDX_RIGHT_EYE = 263
+        self.IDX_NOSE_TIP = 1
+        self.IDX_MOUTH_LEFT = 61
+        self.IDX_MOUTH_RIGHT = 291
+
+        self._prev_box: Optional[np.ndarray] = None
+        self._prev_kps: Optional[np.ndarray] = None
+
+    def _haar_faces(self, gray: np.ndarray) -> np.ndarray:
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            flags=cv2.CASCADE_SCALE_IMAGE,
+            minSize=self.min_size,
+        )
+        if faces is None or len(faces) == 0:
+            return np.zeros((0, 4), dtype=np.int32)
+        # faces are (x,y,w,h)
+        return faces.astype(np.int32)
+
+    def _facemesh_5pt(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+        # Convert to MP Image
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        
+        # Detect
+        res = self.landmarker.detect(mp_image)
+        
+        if not res.face_landmarks:
+            return None
+        
+        lm = res.face_landmarks[0] # List of NormalizedLandmark
+        H, W = frame_bgr.shape[:2]
+        
+        idxs = [
+            self.IDX_LEFT_EYE,
+            self.IDX_RIGHT_EYE,
+            self.IDX_NOSE_TIP,
+            self.IDX_MOUTH_LEFT,
+            self.IDX_MOUTH_RIGHT,
+        ]
+        
+        pts = []
+        for i in idxs:
+            p = lm[i]
+            pts.append([p.x * W, p.y * H])
+            
+        kps = np.array(pts, dtype=np.float32) # (5,2)
+        
+        # Ensure left/right ordering for eyes & mouth
+        if kps[0, 0] > kps[1, 0]:
+            kps[[0, 1]] = kps[[1, 0]]
+        if kps[3, 0] > kps[4, 0]:
+            kps[[3, 4]] = kps[[4, 3]]
+            
+        return kps
+
+    def detect(self, frame_bgr: np.ndarray, max_faces: int = 1) -> List[FaceKpsBox]:
+        H, W = frame_bgr.shape[:2]
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        
+        faces = self._haar_faces(gray)
+        if faces.shape[0] == 0:
+            return []
+
+        # pick largest Haar face
+        areas = faces[:, 2] * faces[:, 3]
+        i = int(np.argmax(areas))
+        x, y, w, h = faces[i].tolist()
+        
+        # FaceMesh confirmation + 5pt
+        kps = self._facemesh_5pt(frame_bgr)
+        
+        if kps is None:
+            # reject Haar false positives 
+            if self.debug:
+                print("[haar_5pt] Haar face found but FaceMesh returned none -> reject")
             return []
             
-        # Sort by area if return_largest is True
-        if return_largest and len(faces) > 1:
-            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-            faces = [faces[0]]  # Keep only largest
-            
-        results = []
+        # OPTIONAL: require FaceMesh points to fall reasonably inside Haar box (prevents random FaceMesh on background)
+        margin = 0.35 # generous, because Haar can be loose
+        x1m = x - margin * w
+        y1m = y - margin * h
+        x2m = x + (1.0 + margin) * w
+        y2m = y + (1.0 + margin) * h
         
-        # Extract landmarks for each face
-        for face_bbox in faces:
-            landmarks_5pt = self.landmark_detector.detect_landmarks(image, face_bbox)
-            results.append((face_bbox, landmarks_5pt))
-            
-        return results
+        inside = (
+            (kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) &
+            (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m)
+        )
+        if inside.mean() < 0.60:
+            if self.debug:
+                print("[haar_5pt] FaceMesh points not consistent with Haar box -> reject")
+            return []
+
+        if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * w)):
+            if self.debug:
+                print("[haar_5pt] 5pt geometry sanity failed -> reject")
+            return []
+
+        # Build centered bbox from keypoints (solves your "aside" offset)
+        box = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+        box = _clip_box_xyxy(box, W, H)
         
-    def process_frame(self, image):
-        """
-        Process a single frame and return detection results
+        # Smooth
+        box_s = _ema(self._prev_box, box, self.smooth_alpha)
+        kps_s = _ema(self._prev_kps, kps, self.smooth_alpha)
         
-        Args:
-            image: Input image (BGR)
-            
-        Returns:
-            dict: Processing results with keys:
-                  - faces: List of face bounding boxes
-                  - landmarks: List of 5-point landmarks (same order as faces)
-                  - largest_face: Largest face bbox or None
-                  - largest_landmarks: Landmarks for largest face or None
-        """
-        # Get all detections
-        detections = self.detect_faces_and_landmarks(image, return_largest=False)
+        self._prev_box = box_s.copy()
+        self._prev_kps = kps_s.copy()
         
-        faces = []
-        landmarks = []
+        x1, y1, x2, y2 = box_s.tolist()
         
-        for face_bbox, landmarks_5pt in detections:
-            faces.append(face_bbox)
-            landmarks.append(landmarks_5pt)
-            
-        # Find largest face
-        largest_face = None
-        largest_landmarks = None
+        # Haar doesn't provide a probability; use a stable placeholder score
+        score = 1.0
+
+        return [
+            FaceKpsBox(
+                x1=int(round(x1)),
+                y1=int(round(y1)),
+                x2=int(round(x2)),
+                y2=int(round(y2)),
+                score=float(score),
+                kps=kps_s.astype(np.float32),
+            )
+        ][:max_faces]
+
+# -------------------------
+# Demo
+# -------------------------
+def main():
+    cap = cv2.VideoCapture(0)
+    det = Haar5ptDetector(
+        min_size=(60, 60),
+        smooth_alpha=0.80,
+        debug=True,
+    )
+    
+    print("Haar + 5pt (FaceMesh) test. Press q to quit.")
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        
+        faces = det.detect(frame, max_faces=1)
+        vis = frame.copy()
         
         if faces:
-            # Find face with largest area
-            areas = [w * h for (x, y, w, h) in faces]
-            largest_idx = np.argmax(areas)
-            largest_face = faces[largest_idx]
-            largest_landmarks = landmarks[largest_idx]
+            f = faces[0]
+            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
             
-        return {
-            'faces': faces,
-            'landmarks': landmarks,
-            'largest_face': largest_face,
-            'largest_landmarks': largest_landmarks,
-            'num_faces': len(faces)
-        }
-        
-    def draw_detections(self, image, detections, draw_all=True):
-        """
-        Draw detection results on image
-        
-        Args:
-            image: Input image
-            detections: Results from process_frame()
-            draw_all: If True, draw all faces; if False, draw only largest
-            
-        Returns:
-            numpy.ndarray: Image with drawn detections
-        """
-        result = image.copy()
-        
-        if draw_all:
-            # Draw all faces and landmarks
-            faces = detections['faces']
-            landmarks_list = detections['landmarks']
-            
-            for i, (face_bbox, landmarks_5pt) in enumerate(zip(faces, landmarks_list)):
-                # Draw face bounding box
-                x, y, w, h = face_bbox
-                color = (0, 255, 0) if i == 0 else (255, 0, 0)  # Green for first, blue for others
-                cv2.rectangle(result, (x, y), (x + w, y + h), color, 2)
+            for (x, y) in f.kps.astype(int):
+                cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
                 
-                # Draw face number
-                cv2.putText(result, f"Face {i+1}", (x, y - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                
-                # Draw landmarks if available
-                if landmarks_5pt is not None:
-                    result = self.landmark_detector.draw_landmarks(result, landmarks_5pt)
-        else:
-            # Draw only largest face
-            largest_face = detections['largest_face']
-            largest_landmarks = detections['largest_landmarks']
-            
-            if largest_face is not None:
-                x, y, w, h = largest_face
-                cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.putText(result, "Largest Face", (x, y - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                if largest_landmarks is not None:
-                    result = self.landmark_detector.draw_landmarks(result, largest_landmarks)
-                    
-        return result
-        
-    def get_face_quality_score(self, face_bbox, landmarks_5pt, image_shape):
-        """
-        Compute face quality score based on size and landmark geometry
-        
-        Args:
-            face_bbox: Face bounding box (x, y, w, h)
-            landmarks_5pt: 5-point landmarks
-            image_shape: Image shape (h, w, c)
-            
-        Returns:
-            float: Quality score [0, 1]
-        """
-        if landmarks_5pt is None:
-            return 0.0
-            
-        x, y, w, h = face_bbox
-        img_h, img_w = image_shape[:2]
-        
-        # Size score (larger faces are better)
-        face_area = w * h
-        img_area = img_h * img_w
-        size_score = min(face_area / (img_area * 0.1), 1.0)  # Normalize to [0, 1]
-        
-        # Position score (centered faces are better)
-        face_center_x = x + w // 2
-        face_center_y = y + h // 2
-        img_center_x = img_w // 2
-        img_center_y = img_h // 2
-        
-        center_dist = np.sqrt((face_center_x - img_center_x)**2 + (face_center_y - img_center_y)**2)
-        max_dist = np.sqrt(img_center_x**2 + img_center_y**2)
-        position_score = 1.0 - (center_dist / max_dist)
-        
-        # Landmark geometry score
-        from align import FaceAligner
-        aligner = FaceAligner()
-        geometry = aligner.get_alignment_quality(landmarks_5pt)
-        
-        if geometry:
-            geometry_score = geometry['quality_score']
-        else:
-            geometry_score = 0.0
-            
-        # Combined score
-        quality_score = (size_score * 0.4 + position_score * 0.3 + geometry_score * 0.3)
-        
-        return quality_score
-
-def test_haar_5pt():
-    """Test combined Haar + 5-point detection"""
-    print("Testing combined Haar + 5-point detection...")
-    
-    try:
-        from camera import Camera
-        
-        detector = HaarFivePtDetector()
-        
-        with Camera() as camera:
-            print("Combined detection test started")
-            print("Press 'q' to quit, 's' to save results, 'a' to toggle show all faces")
-            
-            show_all = True
-            
-            while True:
-                ret, frame = camera.read_frame()
-                if not ret:
-                    print("Failed to read frame")
-                    break
-                    
-                # Process frame
-                detections = detector.process_frame(frame)
-                
-                # Draw results
-                result = detector.draw_detections(frame, detections, draw_all=show_all)
-                
-                # Display info
-                cv2.putText(result, f"Faces detected: {detections['num_faces']}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                
-                if detections['largest_face'] is not None:
-                    # Show quality score for largest face
-                    quality = detector.get_face_quality_score(
-                        detections['largest_face'], 
-                        detections['largest_landmarks'], 
-                        frame.shape
-                    )
-                    cv2.putText(result, f"Quality: {quality:.2f}", (10, 70),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                mode_text = "All faces" if show_all else "Largest only"
-                cv2.putText(result, f"Mode: {mode_text}", (10, 110),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                
-                cv2.putText(result, "Press 'q' quit, 's' save, 'a' toggle mode", (10, 400),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                
-                cv2.imshow('Haar + 5-Point Detection', result)
-                
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('s'):
-                    # Save results
-                    cv2.imwrite('haar_5pt_result.jpg', result)
-                    print("Saved detection result")
-                    
-                    # Save detection data
-                    if detections['largest_landmarks'] is not None:
-                        np.savetxt('haar_5pt_landmarks.txt', detections['largest_landmarks'], fmt='%.2f')
-                        print("Saved landmark coordinates")
-                elif key == ord('a'):
-                    show_all = not show_all
-                    print(f"Show all faces: {show_all}")
-                    
-    except Exception as e:
-        print(f"Combined detection test failed: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        cv2.destroyAllWindows()
-
-def test_haar_5pt_image(image_path):
-    """Test combined detection on a single image"""
-    import os
-    
-    if not os.path.exists(image_path):
-        print(f"Image not found: {image_path}")
-        return
-        
-    detector = HaarFivePtDetector()
-    
-    # Load image
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Failed to load image: {image_path}")
-        return
-        
-    # Process
-    detections = detector.process_frame(image)
-    
-    print(f"Detection results for {image_path}:")
-    print(f"  Faces detected: {detections['num_faces']}")
-    
-    if detections['largest_face'] is not None:
-        x, y, w, h = detections['largest_face']
-        print(f"  Largest face: ({x}, {y}) {w}x{h}")
-        
-        if detections['largest_landmarks'] is not None:
-            print(f"  5-point landmarks detected")
-            quality = detector.get_face_quality_score(
-                detections['largest_face'], 
-                detections['largest_landmarks'], 
-                image.shape
+            cv2.putText(
+                vis,
+                f"OK",
+                (f.x1, max(0, f.y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
             )
-            print(f"  Quality score: {quality:.3f}")
         else:
-            print(f"  No landmarks detected")
-    else:
-        print(f"  No faces detected")
-        
-    # Draw and display results
-    result = detector.draw_detections(image, detections, draw_all=True)
-    
-    cv2.imshow('Haar + 5-Point Detection - Image', result)
-    cv2.waitKey(0)
+            cv2.putText(vis, "no face", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            
+        cv2.imshow("haar_5pt", vis)
+        if (cv2.waitKey(1) & 0xFF) == ord("q"):
+            break
+            
+    cap.release()
     cv2.destroyAllWindows()
-    
-    # Save result
-    cv2.imwrite('haar_5pt_image_result.jpg', result)
-    print("Saved result as 'haar_5pt_image_result.jpg'")
-
-def benchmark_detection_speed():
-    """Benchmark detection speed"""
-    print("Benchmarking detection speed...")
-    
-    try:
-        from camera import Camera
-        import time
-        
-        detector = HaarFivePtDetector()
-        
-        with Camera() as camera:
-            print("Collecting frames for benchmark...")
-            
-            # Collect test frames
-            test_frames = []
-            for i in range(30):
-                ret, frame = camera.read_frame()
-                if ret:
-                    test_frames.append(frame)
-                    
-            if not test_frames:
-                print("No frames captured")
-                return
-                
-            print(f"Benchmarking with {len(test_frames)} frames...")
-            
-            # Benchmark
-            start_time = time.time()
-            total_faces = 0
-            
-            for frame in test_frames:
-                detections = detector.process_frame(frame)
-                total_faces += detections['num_faces']
-                
-            end_time = time.time()
-            
-            # Results
-            total_time = end_time - start_time
-            fps = len(test_frames) / total_time
-            avg_faces = total_faces / len(test_frames)
-            
-            print(f"\nBenchmark Results:")
-            print(f"  Frames processed: {len(test_frames)}")
-            print(f"  Total time: {total_time:.2f} seconds")
-            print(f"  FPS: {fps:.1f}")
-            print(f"  Average faces per frame: {avg_faces:.1f}")
-            print(f"  Time per frame: {total_time/len(test_frames)*1000:.1f} ms")
-            
-    except Exception as e:
-        print(f"Benchmark failed: {e}")
-
-def main():
-    """Main interface for combined detector"""
-    print("=== Haar + 5-Point Detection System ===")
-    print("1. Live detection (camera)")
-    print("2. Test on image file")
-    print("3. Benchmark speed")
-    print("4. Quit")
-    
-    choice = input("Choose option: ").strip()
-    
-    if choice == '1':
-        test_haar_5pt()
-    elif choice == '2':
-        image_path = input("Enter image path: ").strip()
-        if image_path:
-            test_haar_5pt_image(image_path)
-    elif choice == '3':
-        benchmark_detection_speed()
-    elif choice == '4':
-        pass
-    else:
-        print("Invalid choice")
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1:
-        # Test on image file
-        test_haar_5pt_image(sys.argv[1])
-    else:
-        # Interactive mode
-        main()
+    main()
